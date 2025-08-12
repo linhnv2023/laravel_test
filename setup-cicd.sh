@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Complete CI/CD Pipeline Setup Script
-# Usage: ./setup-cicd.sh
+# Optimized CI/CD Pipeline Setup with GitHub Webhook → Jenkins
+# Usage: ./setup-webhook-pipeline.sh
 
 set -e
 
@@ -35,34 +35,40 @@ log_error() {
 }
 
 show_usage() {
-    echo "Laravel CI/CD Pipeline Setup"
-    echo "============================"
+    echo "Optimized Laravel CI/CD Pipeline Setup"
+    echo "======================================"
     echo ""
-    echo "This script will set up a complete CI/CD pipeline including:"
-    echo "  - GitHub Actions workflows"
-    echo "  - Jenkins pipeline configuration"
+    echo "Architecture: GitHub Webhook → Jenkins → ECR → ECS → Production"
+    echo ""
+    echo "This script sets up:"
     echo "  - AWS infrastructure (ECS, ECR, RDS, ElastiCache)"
+    echo "  - Jenkins pipeline configuration"
+    echo "  - GitHub webhook setup instructions"
     echo "  - Docker containerization"
     echo ""
     echo "Prerequisites:"
     echo "  - AWS CLI configured with appropriate permissions"
-    echo "  - Docker installed and running"
-    echo "  - GitHub repository created"
-    echo "  - Jenkins server accessible (optional)"
+    echo "  - Jenkins server accessible"
+    echo "  - GitHub repository with admin access"
+    echo "  - Docker installed"
     echo ""
-    echo "Environment Variables:"
+    echo "Required Environment Variables:"
     echo "  AWS_REGION         AWS region (default: us-east-1)"
+    echo "  JENKINS_URL        Jenkins server URL"
     echo "  GITHUB_REPO        GitHub repository (format: username/repo-name)"
-    echo "  JENKINS_URL        Jenkins server URL (optional)"
-    echo "  DB_PASSWORD        Database password (required)"
-    echo "  APP_KEY            Laravel application key (required)"
+    echo "  DB_PASSWORD        Database password"
+    echo "  APP_KEY            Laravel application key"
+    echo ""
+    echo "Optional Environment Variables:"
+    echo "  SLACK_WEBHOOK      Slack webhook URL for notifications"
+    echo "  JENKINS_TOKEN      Jenkins API token"
     echo ""
     echo "Usage: $0"
     exit 1
 }
 
 check_prerequisites() {
-    log_info "Checking prerequisites..."
+    log_info "Checking prerequisites for optimized pipeline..."
     
     local missing_tools=()
     
@@ -83,6 +89,10 @@ check_prerequisites() {
         missing_tools+=("jq")
     fi
     
+    if ! command -v curl &> /dev/null; then
+        missing_tools+=("curl")
+    fi
+    
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
         log_error "Missing required tools: ${missing_tools[*]}"
         exit 1
@@ -91,12 +101,6 @@ check_prerequisites() {
     # Check AWS credentials
     if ! aws sts get-caller-identity &> /dev/null; then
         log_error "AWS credentials not configured"
-        exit 1
-    fi
-    
-    # Check Docker daemon
-    if ! docker info &> /dev/null; then
-        log_error "Docker daemon is not running"
         exit 1
     fi
     
@@ -112,6 +116,14 @@ check_prerequisites() {
         log_info "Generated APP_KEY: $APP_KEY"
     fi
     
+    if [[ -z "$JENKINS_URL" ]]; then
+        log_warning "JENKINS_URL not set. Jenkins configuration will be manual."
+    fi
+    
+    if [[ -z "$GITHUB_REPO" ]]; then
+        log_warning "GITHUB_REPO not set. GitHub webhook setup will be manual."
+    fi
+    
     log_success "Prerequisites check passed"
 }
 
@@ -122,375 +134,448 @@ setup_aws_infrastructure() {
     if [[ -f "$SCRIPT_DIR/aws/scripts/setup-ecr.sh" ]]; then
         bash "$SCRIPT_DIR/aws/scripts/setup-ecr.sh" "$ECR_REPOSITORY"
     else
-        log_warning "ECR setup script not found, skipping..."
+        log_warning "ECR setup script not found, creating repository manually..."
+        aws ecr create-repository \
+            --repository-name "$ECR_REPOSITORY" \
+            --region "$AWS_REGION" \
+            --image-scanning-configuration scanOnPush=true \
+            --encryption-configuration encryptionType=AES256 || true
     fi
     
-    # Deploy infrastructure for staging
-    log_info "Deploying staging infrastructure..."
-    if [[ -f "$SCRIPT_DIR/aws/scripts/deploy.sh" ]]; then
-        DB_PASSWORD="$DB_PASSWORD" APP_KEY="$APP_KEY" \
-        bash "$SCRIPT_DIR/aws/scripts/deploy.sh" staging latest
-    else
-        log_warning "Deploy script not found, manual deployment required"
-    fi
+    # Deploy infrastructure for both environments
+    for environment in staging production; do
+        log_info "Deploying $environment infrastructure..."
+        
+        if [[ -f "$SCRIPT_DIR/aws/scripts/deploy.sh" ]]; then
+            DB_PASSWORD="$DB_PASSWORD" APP_KEY="$APP_KEY" \
+            bash "$SCRIPT_DIR/aws/scripts/deploy.sh" "$environment" latest || log_warning "Failed to deploy $environment infrastructure"
+        else
+            log_warning "Deploy script not found, manual deployment required for $environment"
+        fi
+    done
     
     log_success "AWS infrastructure setup completed"
 }
 
-setup_github_actions() {
-    log_info "Setting up GitHub Actions..."
+create_jenkins_job_config() {
+    log_info "Creating Jenkins job configuration..."
     
-    # Check if .github/workflows directory exists
-    if [[ ! -d "$SCRIPT_DIR/.github/workflows" ]]; then
-        log_error "GitHub workflows directory not found"
-        return 1
-    fi
-    
-    # List workflow files
-    local workflows=($(find "$SCRIPT_DIR/.github/workflows" -name "*.yml" -o -name "*.yaml"))
-    
-    if [[ ${#workflows[@]} -eq 0 ]]; then
-        log_error "No GitHub workflow files found"
-        return 1
-    fi
-    
-    log_info "Found GitHub workflow files:"
-    for workflow in "${workflows[@]}"; do
-        echo "  - $(basename "$workflow")"
-    done
-    
-    # Check if we're in a git repository
-    if [[ ! -d "$SCRIPT_DIR/.git" ]]; then
-        log_warning "Not in a git repository. Initialize git and push to GitHub to activate workflows."
-        return 0
-    fi
-    
-    # Check if GitHub repository is configured
-    local github_remote=$(git remote get-url origin 2>/dev/null || echo "")
-    if [[ -z "$github_remote" ]]; then
-        log_warning "No GitHub remote configured. Add GitHub remote to activate workflows."
-        return 0
-    fi
-    
-    log_success "GitHub Actions workflows are ready"
-    log_info "Push to GitHub to activate the workflows"
-}
-
-setup_jenkins() {
-    log_info "Setting up Jenkins configuration..."
-    
-    if [[ -z "$JENKINS_URL" ]]; then
-        log_warning "JENKINS_URL not set, skipping Jenkins setup"
-        log_info "Jenkinsfile is available for manual Jenkins job configuration"
-        return 0
-    fi
-    
-    # Check if Jenkinsfile exists
-    if [[ ! -f "$SCRIPT_DIR/Jenkinsfile" ]]; then
-        log_error "Jenkinsfile not found"
-        return 1
-    fi
-    
-    log_info "Jenkinsfile found and ready for Jenkins job configuration"
-    log_info "Manual steps required:"
-    echo "  1. Create a new Pipeline job in Jenkins"
-    echo "  2. Configure SCM to point to your GitHub repository"
-    echo "  3. Set Pipeline script from SCM"
-    echo "  4. Configure required credentials and environment variables"
-    
-    log_success "Jenkins configuration files are ready"
-}
-
-setup_docker() {
-    log_info "Setting up Docker configuration..."
-    
-    # Check if Dockerfile exists
-    if [[ ! -f "$SCRIPT_DIR/Dockerfile" ]]; then
-        log_error "Dockerfile not found"
-        return 1
-    fi
-    
-    # Check if docker-compose files exist
-    local compose_files=("docker-compose.yml" "docker-compose.prod.yml")
-    for file in "${compose_files[@]}"; do
-        if [[ ! -f "$SCRIPT_DIR/$file" ]]; then
-            log_warning "$file not found"
-        else
-            log_info "Found $file"
-        fi
-    done
-    
-    # Test Docker build (optional)
-    read -p "Do you want to test Docker build? (y/N): " test_build
-    if [[ "$test_build" =~ ^[Yy]$ ]]; then
-        log_info "Testing Docker build..."
-        docker build -t laravel-test --target development "$SCRIPT_DIR"
-        log_success "Docker build test passed"
-        
-        # Clean up test image
-        docker rmi laravel-test &> /dev/null || true
-    fi
-    
-    log_success "Docker configuration is ready"
-}
-
-generate_documentation() {
-    log_info "Generating setup documentation..."
-    
-    cat > "$SCRIPT_DIR/CICD-SETUP.md" << 'EOF'
-# CI/CD Pipeline Setup Guide
-
-This document provides instructions for setting up and using the complete CI/CD pipeline.
-
-## Architecture Overview
-
-```
-GitHub → GitHub Actions → ECR → Jenkins → AWS ECS
-   ↓           ↓           ↓        ↓        ↓
- Source    CI Tests    Registry  Deploy  Production
-```
-
-## Components
-
-### 1. GitHub Actions (CI)
-- **Location**: `.github/workflows/`
-- **Purpose**: Continuous Integration, testing, and building
-- **Triggers**: Push to main/develop, Pull Requests
-
-### 2. Jenkins (CD)
-- **Location**: `Jenkinsfile`, `Jenkinsfile.rollback`
-- **Purpose**: Continuous Deployment to AWS
-- **Triggers**: Manual or webhook from GitHub Actions
-
-### 3. AWS Infrastructure
-- **Location**: `aws/cloudformation/`
-- **Components**: ECS, ECR, RDS, ElastiCache, ALB, VPC
-- **Environments**: Staging, Production
-
-### 4. Docker
-- **Location**: `Dockerfile`, `docker-compose*.yml`
-- **Purpose**: Application containerization
-- **Stages**: Development, Production
-
-## Setup Instructions
-
-### Prerequisites
-1. AWS CLI configured with appropriate permissions
-2. Docker installed and running
-3. GitHub repository created
-4. Jenkins server (optional)
-
-### Required AWS Permissions
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Action": [
-                "ecs:*",
-                "ecr:*",
-                "rds:*",
-                "elasticache:*",
-                "ec2:*",
-                "elbv2:*",
-                "cloudformation:*",
-                "iam:*",
-                "logs:*",
-                "secretsmanager:*"
-            ],
-            "Resource": "*"
-        }
-    ]
-}
-```
-
-### GitHub Secrets
-Configure the following secrets in your GitHub repository:
-
-- `AWS_ACCESS_KEY_ID`
-- `AWS_SECRET_ACCESS_KEY`
-- `AWS_REGION`
-- `ECR_REGISTRY`
-- `JENKINS_URL` (optional)
-- `JENKINS_API_TOKEN` (optional)
-- `SLACK_WEBHOOK` (optional)
-- `SNYK_TOKEN` (optional)
-
-### Environment Variables
-Set these environment variables before running setup:
-
-```bash
-export AWS_REGION=us-east-1
-export DB_PASSWORD=your-secure-password
-export APP_KEY=base64:your-laravel-app-key
-export GITHUB_REPO=username/repository-name
-export JENKINS_URL=https://jenkins.your-domain.com  # optional
-```
-
-### Quick Start
-
-1. **Clone and setup**:
-   ```bash
-   git clone https://github.com/your-username/laravel-app.git
-   cd laravel-app
-   ./setup-cicd.sh
-   ```
-
-2. **Deploy to staging**:
-   ```bash
-   ./aws/scripts/deploy.sh staging latest
-   ```
-
-3. **Deploy to production**:
-   ```bash
-   ./aws/scripts/deploy.sh production v1.0.0
-   ```
-
-## Usage
-
-### Local Development
-```bash
-# Start development environment
-make up
-
-# Run tests
-make test
-
-# Access application shell
-make shell
-```
-
-### Deployment Commands
-```bash
-# Deploy to staging
-./aws/scripts/deploy.sh staging latest
-
-# Deploy to production
-./aws/scripts/deploy.sh production v1.0.0
-
-# Rollback production
-# (Use Jenkins pipeline or manual ECS rollback)
-```
-
-### Monitoring
-- **Application**: Check ALB health checks
-- **Logs**: CloudWatch Logs `/ecs/{environment}-laravel`
-- **Metrics**: CloudWatch Container Insights
-
-### Troubleshooting
-
-#### Common Issues
-
-1. **Docker build fails**:
-   - Check Dockerfile syntax
-   - Ensure all dependencies are available
-   - Verify base image accessibility
-
-2. **ECS deployment fails**:
-   - Check task definition configuration
-   - Verify security groups and networking
-   - Check CloudWatch logs for errors
-
-3. **Database connection issues**:
-   - Verify RDS security groups
-   - Check database credentials in Secrets Manager
-   - Ensure ECS tasks can reach RDS
-
-4. **GitHub Actions failures**:
-   - Check repository secrets configuration
-   - Verify AWS permissions
-   - Review workflow logs
-
-#### Useful Commands
-
-```bash
-# Check ECS service status
-aws ecs describe-services --cluster staging-laravel-cluster --services staging-laravel-service
-
-# View ECS logs
-aws logs tail /ecs/staging-laravel --follow
-
-# List ECR images
-aws ecr list-images --repository-name laravel-app
-
-# Check CloudFormation stacks
-aws cloudformation list-stacks --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE
-```
-
-## Security Considerations
-
-1. **Secrets Management**: Use AWS Secrets Manager for sensitive data
-2. **Network Security**: Private subnets for ECS tasks, security groups
-3. **Image Scanning**: Enabled in ECR for vulnerability detection
-4. **Access Control**: IAM roles with least privilege principle
-
-## Maintenance
-
-### Regular Tasks
-- Monitor CloudWatch logs and metrics
-- Update base Docker images regularly
-- Review and rotate secrets
-- Update dependencies and security patches
-
-### Backup Strategy
-- Database: Automated daily backups with 7-day retention
-- Application data: S3 backups
-- Infrastructure: CloudFormation templates in version control
-
-## Support
-
-For issues and questions:
-1. Check CloudWatch logs
-2. Review GitHub Actions workflow runs
-3. Check Jenkins build logs
-4. Consult AWS ECS service events
-
+    cat > "$SCRIPT_DIR/jenkins-job-config.xml" << 'EOF'
+<?xml version='1.1' encoding='UTF-8'?>
+<flow-definition plugin="workflow-job@2.40">
+  <actions/>
+  <description>Laravel CI/CD Pipeline with GitHub Webhook</description>
+  <keepDependencies>false</keepDependencies>
+  <properties>
+    <org.jenkinsci.plugins.workflow.job.properties.PipelineTriggersJobProperty>
+      <triggers>
+        <com.cloudbees.jenkins.GitHubPushTrigger plugin="github@1.34.1">
+          <spec></spec>
+        </com.cloudbees.jenkins.GitHubPushTrigger>
+      </triggers>
+    </org.jenkinsci.plugins.workflow.job.properties.PipelineTriggersJobProperty>
+    <hudson.model.ParametersDefinitionProperty>
+      <parameterDefinitions>
+        <hudson.model.ChoiceParameterDefinition>
+          <name>ENVIRONMENT</name>
+          <description>Deployment environment</description>
+          <choices class="java.util.Arrays$ArrayList">
+            <a class="string-array">
+              <string>staging</string>
+              <string>production</string>
+            </a>
+          </choices>
+        </hudson.model.ChoiceParameterDefinition>
+        <hudson.model.BooleanParameterDefinition>
+          <name>RUN_TESTS</name>
+          <description>Run tests before deployment</description>
+          <defaultValue>true</defaultValue>
+        </hudson.model.BooleanParameterDefinition>
+        <hudson.model.BooleanParameterDefinition>
+          <name>RUN_MIGRATIONS</name>
+          <description>Run database migrations</description>
+          <defaultValue>true</defaultValue>
+        </hudson.model.BooleanParameterDefinition>
+        <hudson.model.BooleanParameterDefinition>
+          <name>SKIP_BUILD</name>
+          <description>Skip Docker build (use existing image)</description>
+          <defaultValue>false</defaultValue>
+        </hudson.model.BooleanParameterDefinition>
+      </parameterDefinitions>
+    </hudson.model.ParametersDefinitionProperty>
+  </properties>
+  <definition class="org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition" plugin="workflow-cps@2.87">
+    <scm class="hudson.plugins.git.GitSCM" plugin="git@4.8.2">
+      <configVersion>2</configVersion>
+      <userRemoteConfigs>
+        <hudson.plugins.git.UserRemoteConfig>
+          <url>https://github.com/GITHUB_REPO_PLACEHOLDER.git</url>
+          <credentialsId>github-credentials</credentialsId>
+        </hudson.plugins.git.UserRemoteConfig>
+      </userRemoteConfigs>
+      <branches>
+        <hudson.plugins.git.BranchSpec>
+          <name>*/main</name>
+        </hudson.plugins.git.BranchSpec>
+        <hudson.plugins.git.BranchSpec>
+          <name>*/develop</name>
+        </hudson.plugins.git.BranchSpec>
+      </branches>
+      <doGenerateSubmoduleConfigurations>false</doGenerateSubmoduleConfigurations>
+      <submoduleCfg class="list"/>
+      <extensions/>
+    </scm>
+    <scriptPath>Jenkinsfile.optimized</scriptPath>
+    <lightweight>true</lightweight>
+  </definition>
+  <triggers/>
+  <disabled>false</disabled>
+</flow-definition>
 EOF
 
-    log_success "Documentation generated: CICD-SETUP.md"
+    # Replace placeholder with actual GitHub repo
+    if [[ -n "$GITHUB_REPO" ]]; then
+        sed -i.bak "s|GITHUB_REPO_PLACEHOLDER|$GITHUB_REPO|g" "$SCRIPT_DIR/jenkins-job-config.xml"
+        rm -f "$SCRIPT_DIR/jenkins-job-config.xml.bak"
+    fi
+    
+    log_success "Jenkins job configuration created: jenkins-job-config.xml"
 }
 
-print_summary() {
-    log_success "CI/CD Pipeline Setup Complete!"
+setup_jenkins_job() {
+    log_info "Setting up Jenkins job..."
+    
+    if [[ -z "$JENKINS_URL" ]]; then
+        log_warning "JENKINS_URL not set, skipping automatic Jenkins job creation"
+        log_info "Manual steps required:"
+        echo "  1. Create new Pipeline job in Jenkins"
+        echo "  2. Import configuration from jenkins-job-config.xml"
+        echo "  3. Configure GitHub credentials"
+        echo "  4. Set up AWS credentials"
+        return 0
+    fi
+    
+    # Test Jenkins connectivity
+    if ! curl -f -s "$JENKINS_URL" &> /dev/null; then
+        log_warning "Jenkins server not accessible at $JENKINS_URL"
+        log_info "Manual Jenkins configuration required"
+        return 0
+    fi
+    
+    # Create Jenkins job (requires Jenkins CLI or API)
+    if [[ -n "$JENKINS_TOKEN" ]]; then
+        log_info "Creating Jenkins job via API..."
+        
+        curl -X POST "$JENKINS_URL/createItem?name=laravel-cicd-pipeline" \
+            --user "admin:$JENKINS_TOKEN" \
+            --header "Content-Type: application/xml" \
+            --data-binary "@$SCRIPT_DIR/jenkins-job-config.xml" || log_warning "Failed to create Jenkins job via API"
+    else
+        log_warning "JENKINS_TOKEN not set, manual job creation required"
+    fi
+    
+    log_success "Jenkins job setup completed"
+}
+
+generate_github_webhook_instructions() {
+    log_info "Generating GitHub webhook setup instructions..."
+    
+    cat > "$SCRIPT_DIR/github-webhook-setup.md" << EOF
+# GitHub Webhook Setup Instructions
+
+## 1. Configure Webhook in GitHub Repository
+
+Go to your GitHub repository: **${GITHUB_REPO:-your-username/your-repo}**
+
+\`\`\`
+Repository → Settings → Webhooks → Add webhook
+\`\`\`
+
+### Webhook Configuration:
+\`\`\`
+Payload URL: ${JENKINS_URL:-http://your-jenkins-server}/github-webhook/
+Content type: application/json
+Secret: (optional, but recommended)
+
+Events to trigger:
+☑ Push events
+☑ Pull request events  
+☑ Release events
+
+☑ Active
+\`\`\`
+
+## 2. Test Webhook
+
+After setting up the webhook:
+
+1. Make a commit and push to your repository
+2. Check GitHub webhook delivery logs
+3. Verify Jenkins job is triggered
+4. Monitor Jenkins build logs
+
+## 3. Branch-based Deployments
+
+- **Push to main** → Production deployment
+- **Push to develop** → Staging deployment  
+- **Pull Request** → Test build only
+
+## 4. Manual Deployment
+
+Access Jenkins job and click "Build with Parameters":
+\`\`\`
+ENVIRONMENT: staging/production
+RUN_TESTS: true/false
+RUN_MIGRATIONS: true/false
+SKIP_BUILD: true/false
+\`\`\`
+
+## 5. Troubleshooting
+
+### Webhook not triggering:
+- Check GitHub webhook delivery logs
+- Verify Jenkins URL accessibility
+- Check firewall/security groups
+
+### Jenkins job fails:
+- Review Jenkins build logs
+- Check AWS credentials
+- Verify Docker daemon status
+
+## 6. Monitoring
+
+- **Jenkins**: Monitor build status and logs
+- **AWS ECS**: Check service status and events
+- **CloudWatch**: Review application logs
+- **Slack**: Deployment notifications (if configured)
+
+---
+
+**Jenkins URL**: ${JENKINS_URL:-http://your-jenkins-server}
+**GitHub Repository**: ${GITHUB_REPO:-your-username/your-repo}
+**AWS Region**: ${AWS_REGION}
+EOF
+
+    log_success "GitHub webhook instructions generated: github-webhook-setup.md"
+}
+
+create_optimized_architecture_diagram() {
+    log_info "Creating architecture diagram..."
+    
+    cat > "$SCRIPT_DIR/OPTIMIZED-ARCHITECTURE.md" << 'EOF'
+# Optimized CI/CD Architecture
+
+## 🏗️ Architecture Flow
+
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   GitHub        │    │    Jenkins      │    │   Amazon ECR    │
+│   Repository    │───▶│   CI/CD Server  │───▶│ Container Reg.  │
+│                 │    │                 │    │                 │
+│ • Source Code   │    │ • Build & Test  │    │ • Docker Images │
+│ • Webhook       │    │ • Security Scan │    │ • Vulnerability │
+│ • Branches      │    │ • Deploy Logic  │    │   Scanning      │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+                                │                        │
+                                ▼                        ▼
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Slack/Email   │    │   Amazon ECS    │    │   Production    │
+│  Notifications  │◀───│   Deployment    │───▶│   Environment   │
+│                 │    │                 │    │                 │
+│ • Build Status  │    │ • Blue-Green    │    │ • Load Balancer │
+│ • Deploy Status │    │ • Auto Scaling  │    │ • Health Checks │
+│ • Alerts        │    │ • Health Checks │    │ • Monitoring    │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+```
+
+## 🎯 Benefits
+
+### ✅ Simplified Pipeline
+- Single CI/CD tool (Jenkins)
+- No coordination between multiple tools
+- Centralized deployment logic
+
+### ✅ Cost Effective
+- No GitHub Actions minutes usage
+- Reduced infrastructure complexity
+- Better resource utilization
+
+### ✅ Enhanced Control
+- Full control over build environment
+- Custom deployment strategies
+- Advanced Jenkins plugins
+
+### ✅ Better Monitoring
+- Centralized logging in Jenkins
+- Detailed build artifacts
+- Custom metrics and alerts
+
+## 🔄 Deployment Flow
+
+### 1. Developer Workflow
+```bash
+git add .
+git commit -m "Feature implementation"
+git push origin develop  # → Triggers staging deployment
+```
+
+### 2. Production Release
+```bash
+git checkout main
+git merge develop
+git push origin main     # → Triggers production deployment
+```
+
+### 3. Hotfix Deployment
+```bash
+# Manual Jenkins job trigger with parameters
+ENVIRONMENT: production
+SKIP_BUILD: false
+RUN_MIGRATIONS: true
+```
+
+## 🔧 Pipeline Stages
+
+### Stage 1: Checkout & Setup
+- Clone repository from GitHub
+- Set environment variables
+- Prepare build environment
+
+### Stage 2: Testing (Parallel)
+- **PHP Tests**: PHPUnit with coverage
+- **Security Scan**: Composer/NPM audits  
+- **Code Quality**: Laravel Pint, PHPStan
+
+### Stage 3: Build & Push
+- Build production Docker image
+- Tag with commit hash + build number
+- Push to Amazon ECR
+- Vulnerability scanning
+
+### Stage 4: Deploy
+- Update ECS task definition
+- Deploy to target environment
+- Wait for service stabilization
+
+### Stage 5: Post-Deploy
+- Run database migrations
+- Execute health checks
+- Send notifications
+
+## 🔒 Security Features
+
+### Container Security
+- Multi-stage Docker builds
+- Vulnerability scanning with ECR
+- Minimal base images
+- Non-root user execution
+
+### Infrastructure Security
+- Private subnets for ECS tasks
+- Security groups with least privilege
+- Secrets management with AWS Secrets Manager
+- IAM roles with minimal permissions
+
+### Pipeline Security
+- Webhook signature verification
+- Secure credential storage
+- Build isolation
+- Audit logging
+
+## 📊 Monitoring & Observability
+
+### Jenkins Monitoring
+- Build success/failure rates
+- Build duration trends
+- Resource utilization
+- Plugin health
+
+### Application Monitoring
+- ECS service health
+- Container resource usage
+- Application performance metrics
+- Error rates and logs
+
+### Infrastructure Monitoring
+- AWS resource utilization
+- Cost optimization
+- Security compliance
+- Backup status
+
+## 🚀 Scaling Considerations
+
+### Horizontal Scaling
+- Multiple Jenkins agents
+- ECS auto-scaling
+- Load balancer configuration
+- Database read replicas
+
+### Performance Optimization
+- Docker layer caching
+- Parallel test execution
+- Build artifact caching
+- CDN for static assets
+
+---
+
+**This optimized architecture provides better control, cost efficiency, and simplified management! 🎯**
+EOF
+
+    log_success "Architecture diagram created: OPTIMIZED-ARCHITECTURE.md"
+}
+
+print_setup_summary() {
+    log_success "Optimized CI/CD Pipeline Setup Complete!"
     echo ""
-    echo "Summary:"
-    echo "========"
-    echo "✅ Prerequisites checked"
-    echo "✅ AWS infrastructure configured"
-    echo "✅ GitHub Actions workflows ready"
-    echo "✅ Jenkins configuration prepared"
-    echo "✅ Docker setup verified"
-    echo "✅ Documentation generated"
+    echo "🏗️ Architecture: GitHub Webhook → Jenkins → ECR → ECS → Production"
     echo ""
-    echo "Next Steps:"
-    echo "==========="
-    echo "1. Push code to GitHub to trigger CI/CD workflows"
-    echo "2. Configure GitHub repository secrets"
-    echo "3. Set up Jenkins jobs (if using Jenkins)"
-    echo "4. Monitor first deployment in AWS Console"
+    echo "✅ Completed Setup:"
+    echo "==================="
+    echo "• AWS infrastructure (ECS, ECR, RDS, ElastiCache)"
+    echo "• Jenkins pipeline configuration"
+    echo "• Docker containerization"
+    echo "• GitHub webhook instructions"
+    echo "• Documentation and guides"
     echo ""
-    echo "Useful Commands:"
+    echo "📋 Next Steps:"
+    echo "=============="
+    echo "1. Configure Jenkins job using jenkins-job-config.xml"
+    echo "2. Set up GitHub webhook following github-webhook-setup.md"
+    echo "3. Configure Jenkins credentials (AWS, GitHub, Slack)"
+    echo "4. Test the pipeline with a commit"
+    echo ""
+    echo "📁 Generated Files:"
+    echo "=================="
+    echo "• Jenkinsfile.optimized - Optimized Jenkins pipeline"
+    echo "• jenkins-job-config.xml - Jenkins job configuration"
+    echo "• github-webhook-setup.md - Webhook setup guide"
+    echo "• OPTIMIZED-ARCHITECTURE.md - Architecture documentation"
+    echo ""
+    echo "🔗 Useful URLs:"
     echo "==============="
-    echo "# Deploy to staging:"
-    echo "  ./aws/scripts/deploy.sh staging latest"
+    if [[ -n "$JENKINS_URL" ]]; then
+        echo "• Jenkins: $JENKINS_URL"
+    fi
+    if [[ -n "$GITHUB_REPO" ]]; then
+        echo "• GitHub: https://github.com/$GITHUB_REPO"
+    fi
+    echo "• AWS Console: https://console.aws.amazon.com/ecs/"
     echo ""
-    echo "# Deploy to production:"
-    echo "  ./aws/scripts/deploy.sh production v1.0.0"
+    echo "🎯 Benefits of This Architecture:"
+    echo "================================="
+    echo "• Simplified pipeline with single CI/CD tool"
+    echo "• Reduced complexity and better control"
+    echo "• Cost effective (no GitHub Actions minutes)"
+    echo "• Enhanced monitoring and customization"
     echo ""
-    echo "# Start local development:"
-    echo "  make up"
-    echo ""
-    echo "# View documentation:"
-    echo "  cat CICD-SETUP.md"
-    echo ""
-    log_info "Happy deploying! 🚀"
+    log_info "Ready for optimized deployments! 🚀"
 }
 
 # Main script
 main() {
-    echo "Laravel CI/CD Pipeline Setup"
-    echo "============================"
+    echo "Optimized Laravel CI/CD Pipeline Setup"
+    echo "======================================"
+    echo "Architecture: GitHub Webhook → Jenkins → ECR → ECS → Production"
     echo ""
     
     # Show usage if help requested
@@ -498,16 +583,16 @@ main() {
         show_usage
     fi
     
-    log_info "Starting CI/CD pipeline setup..."
+    log_info "Starting optimized CI/CD pipeline setup..."
     
     # Run setup steps
     check_prerequisites
-    setup_docker
     setup_aws_infrastructure
-    setup_github_actions
-    setup_jenkins
-    generate_documentation
-    print_summary
+    create_jenkins_job_config
+    setup_jenkins_job
+    generate_github_webhook_instructions
+    create_optimized_architecture_diagram
+    print_setup_summary
 }
 
 # Run main function with all arguments

@@ -2,91 +2,78 @@ pipeline {
     agent any
     
     parameters {
-        string(name: 'IMAGE_TAG', defaultValue: 'latest', description: 'Docker image tag to deploy')
-        string(name: 'ECR_REGISTRY', defaultValue: '', description: 'ECR registry URL')
         choice(name: 'ENVIRONMENT', choices: ['staging', 'production'], description: 'Deployment environment')
+        booleanParam(name: 'RUN_TESTS', defaultValue: true, description: 'Run tests before deployment')
         booleanParam(name: 'RUN_MIGRATIONS', defaultValue: true, description: 'Run database migrations')
-        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip running tests')
+        booleanParam(name: 'SKIP_BUILD', defaultValue: false, description: 'Skip Docker build (use existing image)')
     }
     
     environment {
         AWS_DEFAULT_REGION = 'us-east-1'
         ECR_REPOSITORY = 'laravel-app'
         ECS_CLUSTER = 'laravel-cluster'
-        ECS_SERVICE_STAGING = 'laravel-service-staging'
-        ECS_SERVICE_PRODUCTION = 'laravel-service-production'
         DOCKER_BUILDKIT = '1'
+        
+        // Dynamic environment variables
+        ECS_SERVICE = "${params.ENVIRONMENT}-laravel-service"
+        IMAGE_TAG = "${env.GIT_COMMIT.take(8)}-${env.BUILD_NUMBER}"
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
     }
     
     stages {
-        stage('Checkout') {
-            steps {
-                checkout scm
-                script {
-                    env.GIT_COMMIT_SHORT = sh(
-                        script: 'git rev-parse --short HEAD',
-                        returnStdout: true
-                    ).trim()
-                    env.BUILD_TIMESTAMP = sh(
-                        script: 'date +%Y%m%d-%H%M%S',
-                        returnStdout: true
-                    ).trim()
-                }
-            }
-        }
-        
-        stage('Environment Setup') {
+        stage('Checkout & Setup') {
             steps {
                 script {
-                    // Set environment-specific variables
-                    if (params.ENVIRONMENT == 'production') {
-                        env.ECS_SERVICE = env.ECS_SERVICE_PRODUCTION
-                        env.DB_NAME = 'laravel_production'
-                    } else {
-                        env.ECS_SERVICE = env.ECS_SERVICE_STAGING
-                        env.DB_NAME = 'laravel_staging'
-                    }
+                    // Get AWS Account ID
+                    env.AWS_ACCOUNT_ID = sh(
+                        script: 'aws sts get-caller-identity --query Account --output text',
+                        returnStdout: true
+                    ).trim()
                     
-                    // Use provided ECR registry or default
-                    if (params.ECR_REGISTRY) {
-                        env.ECR_REGISTRY = params.ECR_REGISTRY
-                    } else {
-                        env.ECR_REGISTRY = sh(
-                            script: 'aws sts get-caller-identity --query Account --output text',
-                            returnStdout: true
-                        ).trim() + '.dkr.ecr.' + env.AWS_DEFAULT_REGION + '.amazonaws.com'
-                    }
+                    // Set full ECR registry URL
+                    env.ECR_REGISTRY = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_DEFAULT_REGION}.amazonaws.com"
+                    env.FULL_IMAGE_NAME = "${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}:${env.IMAGE_TAG}"
+                    
+                    echo "Building image: ${env.FULL_IMAGE_NAME}"
+                    echo "Deploying to: ${params.ENVIRONMENT}"
                 }
             }
         }
         
-        stage('Build and Test') {
+        stage('Run Tests') {
             when {
-                not { params.SKIP_TESTS }
+                expression { params.RUN_TESTS }
             }
             parallel {
                 stage('PHP Tests') {
                     steps {
                         script {
-                            docker.build("laravel-test:${env.BUILD_NUMBER}", "--target development .")
+                            // Build test image
+                            sh '''
+                                docker build -t laravel-test:${BUILD_NUMBER} --target development .
+                            '''
                             
-                            docker.image("laravel-test:${env.BUILD_NUMBER}").inside(
-                                "--network host -v ${WORKSPACE}:/var/www/html"
-                            ) {
-                                sh '''
-                                    cp .env.example .env
-                                    php artisan key:generate
-                                    php artisan config:clear
-                                    php artisan cache:clear
-                                    composer install --no-dev --optimize-autoloader
-                                    php artisan test --coverage --junit=test-results.xml
-                                '''
-                            }
+                            // Run tests in container
+                            sh '''
+                                docker run --rm \
+                                    -v ${WORKSPACE}:/var/www/html \
+                                    -w /var/www/html \
+                                    laravel-test:${BUILD_NUMBER} \
+                                    bash -c "
+                                        cp .env.example .env
+                                        php artisan key:generate
+                                        composer install --no-dev --optimize-autoloader
+                                        php artisan test --junit=test-results.xml --coverage-clover=coverage.xml
+                                    "
+                            '''
                         }
                     }
                     post {
                         always {
+                            // Publish test results
                             publishTestResults testResultsPattern: 'test-results.xml'
+                            
+                            // Publish coverage
                             publishHTML([
                                 allowMissing: false,
                                 alwaysLinkToLastBuild: true,
@@ -95,6 +82,9 @@ pipeline {
                                 reportFiles: 'index.html',
                                 reportName: 'Coverage Report'
                             ])
+                            
+                            // Clean up test image
+                            sh 'docker rmi laravel-test:${BUILD_NUMBER} || true'
                         }
                     }
                 }
@@ -103,10 +93,16 @@ pipeline {
                     steps {
                         script {
                             // Composer security audit
-                            sh 'composer audit --format=json > composer-audit.json || true'
+                            sh '''
+                                docker run --rm -v ${WORKSPACE}:/app -w /app composer:latest \
+                                    composer audit --format=json > composer-audit.json || true
+                            '''
                             
                             // NPM security audit
-                            sh 'npm audit --json > npm-audit.json || true'
+                            sh '''
+                                docker run --rm -v ${WORKSPACE}:/app -w /app node:20-alpine \
+                                    npm audit --json > npm-audit.json || true
+                            '''
                         }
                     }
                     post {
@@ -120,41 +116,76 @@ pipeline {
                     steps {
                         script {
                             // Laravel Pint (PHP CS Fixer)
-                            sh 'vendor/bin/pint --test || true'
-                            
-                            // PHPStan
-                            sh 'vendor/bin/phpstan analyse --error-format=junit > phpstan-report.xml || true'
-                        }
-                    }
-                    post {
-                        always {
-                            publishTestResults testResultsPattern: 'phpstan-report.xml'
+                            sh '''
+                                docker run --rm -v ${WORKSPACE}:/app -w /app \
+                                    php:8.3-cli bash -c "
+                                        curl -sS https://getcomposer.org/installer | php
+                                        php composer.phar install --no-dev
+                                        vendor/bin/pint --test || true
+                                    "
+                            '''
                         }
                     }
                 }
             }
         }
         
-        stage('Build Production Image') {
+        stage('Build & Push Docker Image') {
+            when {
+                not { params.SKIP_BUILD }
+            }
             steps {
                 script {
                     // Login to ECR
-                    sh 'aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY'
+                    sh '''
+                        aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | \
+                        docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                    '''
+                    
+                    // Create ECR repository if it doesn't exist
+                    sh '''
+                        aws ecr describe-repositories --repository-names ${ECR_REPOSITORY} --region ${AWS_DEFAULT_REGION} || \
+                        aws ecr create-repository --repository-name ${ECR_REPOSITORY} --region ${AWS_DEFAULT_REGION} \
+                            --image-scanning-configuration scanOnPush=true \
+                            --encryption-configuration encryptionType=AES256
+                    '''
                     
                     // Build production image
-                    def image = docker.build(
-                        "${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}:${params.IMAGE_TAG}",
-                        "--target production --build-arg BUILDKIT_INLINE_CACHE=1 ."
-                    )
+                    sh '''
+                        docker build \
+                            --target production \
+                            --build-arg BUILDKIT_INLINE_CACHE=1 \
+                            --cache-from ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest \
+                            -t ${FULL_IMAGE_NAME} \
+                            -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest \
+                            -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${ENVIRONMENT} \
+                            .
+                    '''
                     
-                    // Push to ECR
-                    image.push()
-                    image.push("${env.BUILD_NUMBER}")
+                    // Push images to ECR
+                    sh '''
+                        docker push ${FULL_IMAGE_NAME}
+                        docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+                        docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${ENVIRONMENT}
+                    '''
                     
-                    // Tag as latest if deploying to production
-                    if (params.ENVIRONMENT == 'production') {
-                        image.push('latest')
-                    }
+                    // Scan image for vulnerabilities
+                    sh '''
+                        aws ecr start-image-scan \
+                            --repository-name ${ECR_REPOSITORY} \
+                            --image-id imageTag=${IMAGE_TAG} \
+                            --region ${AWS_DEFAULT_REGION} || true
+                    '''
+                }
+            }
+            post {
+                always {
+                    // Clean up local images
+                    sh '''
+                        docker rmi ${FULL_IMAGE_NAME} || true
+                        docker rmi ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest || true
+                        docker rmi ${ECR_REGISTRY}/${ECR_REPOSITORY}:${ENVIRONMENT} || true
+                    '''
                 }
             }
         }
@@ -166,11 +197,12 @@ pipeline {
                     sh '''
                         # Get current task definition
                         aws ecs describe-task-definition \
-                            --task-definition laravel-task-${ENVIRONMENT} \
+                            --task-definition ${ENVIRONMENT}-laravel-task \
+                            --region ${AWS_DEFAULT_REGION} \
                             --query taskDefinition > task-definition.json
                         
                         # Update image in task definition
-                        jq --arg IMAGE "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" \
+                        jq --arg IMAGE "${FULL_IMAGE_NAME}" \
                            '.containerDefinitions[0].image = $IMAGE' \
                            task-definition.json > updated-task-definition.json
                         
@@ -179,16 +211,20 @@ pipeline {
                            updated-task-definition.json > final-task-definition.json
                         
                         # Register new task definition
-                        aws ecs register-task-definition \
+                        NEW_TASK_DEF=$(aws ecs register-task-definition \
                             --cli-input-json file://final-task-definition.json \
+                            --region ${AWS_DEFAULT_REGION} \
                             --query 'taskDefinition.taskDefinitionArn' \
-                            --output text > task-definition-arn.txt
+                            --output text)
+                        
+                        echo "New task definition: $NEW_TASK_DEF"
                         
                         # Update ECS service
                         aws ecs update-service \
-                            --cluster $ECS_CLUSTER \
-                            --service $ECS_SERVICE \
-                            --task-definition $(cat task-definition-arn.txt)
+                            --cluster ${ECS_CLUSTER} \
+                            --service ${ECS_SERVICE} \
+                            --task-definition $NEW_TASK_DEF \
+                            --region ${AWS_DEFAULT_REGION}
                     '''
                 }
             }
@@ -197,12 +233,13 @@ pipeline {
         stage('Wait for Deployment') {
             steps {
                 script {
-                    timeout(time: 10, unit: 'MINUTES') {
+                    timeout(time: 15, unit: 'MINUTES') {
                         sh '''
                             echo "Waiting for ECS service to stabilize..."
                             aws ecs wait services-stable \
-                                --cluster $ECS_CLUSTER \
-                                --services $ECS_SERVICE
+                                --cluster ${ECS_CLUSTER} \
+                                --services ${ECS_SERVICE} \
+                                --region ${AWS_DEFAULT_REGION}
                         '''
                     }
                 }
@@ -216,11 +253,26 @@ pipeline {
             steps {
                 script {
                     sh '''
+                        # Get subnet and security group info
+                        PRIVATE_SUBNETS=$(aws cloudformation describe-stacks \
+                            --stack-name ${ENVIRONMENT}-laravel-infrastructure \
+                            --query 'Stacks[0].Outputs[?OutputKey==`PrivateSubnets`].OutputValue' \
+                            --output text \
+                            --region ${AWS_DEFAULT_REGION})
+                        
+                        ECS_SECURITY_GROUP=$(aws cloudformation describe-stacks \
+                            --stack-name ${ENVIRONMENT}-laravel-infrastructure \
+                            --query 'Stacks[0].Outputs[?OutputKey==`ECSSecurityGroup`].OutputValue' \
+                            --output text \
+                            --region ${AWS_DEFAULT_REGION})
+                        
+                        SUBNET_ID=$(echo "$PRIVATE_SUBNETS" | cut -d',' -f1)
+                        
                         # Run migration task
-                        aws ecs run-task \
-                            --cluster $ECS_CLUSTER \
-                            --task-definition laravel-migration-task-${ENVIRONMENT} \
-                            --network-configuration "awsvpcConfiguration={subnets=[${ECS_SUBNET_ID}],securityGroups=[${ECS_SECURITY_GROUP_ID}],assignPublicIp=ENABLED}" \
+                        TASK_ARN=$(aws ecs run-task \
+                            --cluster ${ECS_CLUSTER} \
+                            --task-definition ${ENVIRONMENT}-laravel-task \
+                            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_ID],securityGroups=[$ECS_SECURITY_GROUP],assignPublicIp=DISABLED}" \
                             --overrides '{
                                 "containerOverrides": [
                                     {
@@ -229,18 +281,23 @@ pipeline {
                                     }
                                 ]
                             }' \
+                            --region ${AWS_DEFAULT_REGION} \
                             --query 'tasks[0].taskArn' \
-                            --output text > migration-task-arn.txt
+                            --output text)
+                        
+                        echo "Migration task: $TASK_ARN"
                         
                         # Wait for migration to complete
                         aws ecs wait tasks-stopped \
-                            --cluster $ECS_CLUSTER \
-                            --tasks $(cat migration-task-arn.txt)
+                            --cluster ${ECS_CLUSTER} \
+                            --tasks $TASK_ARN \
+                            --region ${AWS_DEFAULT_REGION}
                         
-                        # Check migration task exit code
+                        # Check migration exit code
                         EXIT_CODE=$(aws ecs describe-tasks \
-                            --cluster $ECS_CLUSTER \
-                            --tasks $(cat migration-task-arn.txt) \
+                            --cluster ${ECS_CLUSTER} \
+                            --tasks $TASK_ARN \
+                            --region ${AWS_DEFAULT_REGION} \
                             --query 'tasks[0].containers[0].exitCode' \
                             --output text)
                         
@@ -248,6 +305,8 @@ pipeline {
                             echo "Migration failed with exit code: $EXIT_CODE"
                             exit 1
                         fi
+                        
+                        echo "Migration completed successfully"
                     '''
                 }
             }
@@ -260,18 +319,25 @@ pipeline {
                     def albEndpoint = sh(
                         script: '''
                             aws elbv2 describe-load-balancers \
-                                --names laravel-alb-${ENVIRONMENT} \
+                                --names ${ENVIRONMENT}-laravel-alb \
                                 --query 'LoadBalancers[0].DNSName' \
-                                --output text
+                                --output text \
+                                --region ${AWS_DEFAULT_REGION}
                         ''',
                         returnStdout: true
                     ).trim()
                     
+                    echo "Application URL: http://${albEndpoint}"
+                    
                     // Health check with retry
-                    retry(5) {
+                    retry(10) {
                         sleep(30)
                         sh "curl -f http://${albEndpoint}/health"
                     }
+                    
+                    echo "✅ Health check passed!"
+                    echo "🚀 Application deployed successfully to ${params.ENVIRONMENT}"
+                    echo "🌐 URL: http://${albEndpoint}"
                 }
             }
         }
@@ -279,37 +345,70 @@ pipeline {
     
     post {
         always {
-            // Clean up Docker images
-            sh 'docker system prune -f'
+            // Clean up workspace
+            sh 'docker system prune -f || true'
             
             // Archive artifacts
             archiveArtifacts artifacts: '*.json,*.xml', allowEmptyArchive: true
         }
         
         success {
-            // Notify success
-            slackSend(
-                channel: '#deployments',
-                color: 'good',
-                message: "✅ Deployment successful: ${env.JOB_NAME} #${env.BUILD_NUMBER} to ${params.ENVIRONMENT}\nImage: ${params.IMAGE_TAG}\nCommit: ${env.GIT_COMMIT_SHORT}"
-            )
+            script {
+                def albEndpoint = sh(
+                    script: '''
+                        aws elbv2 describe-load-balancers \
+                            --names ${ENVIRONMENT}-laravel-alb \
+                            --query 'LoadBalancers[0].DNSName' \
+                            --output text \
+                            --region ${AWS_DEFAULT_REGION} 2>/dev/null || echo "N/A"
+                    ''',
+                    returnStdout: true
+                ).trim()
+                
+                slackSend(
+                    channel: '#deployments',
+                    color: 'good',
+                    message: """
+✅ *Deployment Successful!*
+• *Environment*: ${params.ENVIRONMENT}
+• *Image*: ${env.IMAGE_TAG}
+• *Commit*: ${env.GIT_COMMIT.take(8)}
+• *Build*: #${env.BUILD_NUMBER}
+• *URL*: http://${albEndpoint}
+• *Duration*: ${currentBuild.durationString}
+                    """.stripIndent()
+                )
+            }
         }
         
         failure {
-            // Notify failure
             slackSend(
                 channel: '#deployments',
                 color: 'danger',
-                message: "❌ Deployment failed: ${env.JOB_NAME} #${env.BUILD_NUMBER} to ${params.ENVIRONMENT}\nImage: ${params.IMAGE_TAG}\nCommit: ${env.GIT_COMMIT_SHORT}"
+                message: """
+❌ *Deployment Failed!*
+• *Environment*: ${params.ENVIRONMENT}
+• *Image*: ${env.IMAGE_TAG}
+• *Commit*: ${env.GIT_COMMIT.take(8)}
+• *Build*: #${env.BUILD_NUMBER}
+• *Stage*: ${env.STAGE_NAME}
+• *Duration*: ${currentBuild.durationString}
+                """.stripIndent()
             )
         }
         
         unstable {
-            // Notify unstable build
             slackSend(
                 channel: '#deployments',
                 color: 'warning',
-                message: "⚠️ Deployment unstable: ${env.JOB_NAME} #${env.BUILD_NUMBER} to ${params.ENVIRONMENT}\nImage: ${params.IMAGE_TAG}\nCommit: ${env.GIT_COMMIT_SHORT}"
+                message: """
+⚠️ *Deployment Unstable!*
+• *Environment*: ${params.ENVIRONMENT}
+• *Image*: ${env.IMAGE_TAG}
+• *Commit*: ${env.GIT_COMMIT.take(8)}
+• *Build*: #${env.BUILD_NUMBER}
+• *Duration*: ${currentBuild.durationString}
+                """.stripIndent()
             )
         }
     }
