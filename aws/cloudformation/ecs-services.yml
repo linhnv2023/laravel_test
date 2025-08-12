@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Laravel ECS Services, Tasks, and Load Balancer'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: staging
+    AllowedValues: [staging, production]
+    Description: Environment name
+  
+  ImageURI:
+    Type: String
+    Description: Docker image URI from ECR
+  
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: Database password
+  
+  AppKey:
+    Type: String
+    NoEcho: true
+    Description: Laravel application key
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, production]
+
+Resources:
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${Environment}-laravel-cluster
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+        - CapacityProvider: FARGATE_SPOT
+          Weight: !If [IsProduction, 0, 1]
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-laravel-cluster
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${Environment}-laravel-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - Fn::Select: [0, Fn::Split: [',', Fn::ImportValue: !Sub '${Environment}-laravel-public-subnets']]
+        - Fn::Select: [1, Fn::Split: [',', Fn::ImportValue: !Sub '${Environment}-laravel-public-subnets']]
+      SecurityGroups:
+        - Fn::ImportValue: !Sub ${Environment}-laravel-alb-sg-id
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-laravel-alb
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${Environment}-laravel-tg
+      Port: 80
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub ${Environment}-laravel-vpc-id
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: 200
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-laravel-tg
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ECS Task Execution Role
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Environment}-laravel-ecs-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # ECS Task Role
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Environment}-laravel-ecs-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: 
+                  - !Sub 'arn:aws:s3:::${Environment}-laravel-storage/*'
+                  - !Sub 'arn:aws:s3:::laravel-backups/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub 'arn:aws:s3:::${Environment}-laravel-storage'
+                  - !Sub 'arn:aws:s3:::laravel-backups'
+
+  # CloudWatch Log Group
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${Environment}-laravel
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # ECS Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${Environment}-laravel-task
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !If [IsProduction, 1024, 512]
+      Memory: !If [IsProduction, 2048, 1024]
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      TaskRoleArn: !Ref ECSTaskRole
+      ContainerDefinitions:
+        - Name: laravel-app
+          Image: !Ref ImageURI
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          Environment:
+            - Name: APP_ENV
+              Value: !Ref Environment
+            - Name: APP_DEBUG
+              Value: !If [IsProduction, 'false', 'true']
+            - Name: DB_CONNECTION
+              Value: mysql
+            - Name: DB_HOST
+              Value:
+                Fn::ImportValue: !Sub ${Environment}-laravel-db-endpoint
+            - Name: DB_PORT
+              Value: '3306'
+            - Name: DB_DATABASE
+              Value: laravel
+            - Name: DB_USERNAME
+              Value: laravel
+            - Name: REDIS_HOST
+              Value:
+                Fn::ImportValue: !Sub ${Environment}-laravel-redis-endpoint
+            - Name: REDIS_PORT
+              Value: '6379'
+            - Name: CACHE_STORE
+              Value: redis
+            - Name: QUEUE_CONNECTION
+              Value: redis
+            - Name: SESSION_DRIVER
+              Value: redis
+          Secrets:
+            - Name: APP_KEY
+              ValueFrom: !Ref AppKeySecret
+            - Name: DB_PASSWORD
+              ValueFrom: !Ref DBPasswordSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: laravel-app
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://localhost/health || exit 1
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  # Secrets Manager
+  AppKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${Environment}/laravel/app-key
+      Description: Laravel application key
+      SecretString: !Ref AppKey
+
+  DBPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${Environment}/laravel/db-password
+      Description: Database password
+      SecretString: !Ref DBPassword
+
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub ${Environment}-laravel-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !If [IsProduction, 2, 1]
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - Fn::ImportValue: !Sub ${Environment}-laravel-ecs-sg-id
+          Subnets:
+            - Fn::Select: [0, Fn::Split: [',', Fn::ImportValue: !Sub '${Environment}-laravel-private-subnets']]
+            - Fn::Select: [1, Fn::Split: [',', Fn::ImportValue: !Sub '${Environment}-laravel-private-subnets']]
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: laravel-app
+          ContainerPort: 80
+          TargetGroupArn: !Ref ALBTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-laravel-service
+
+Outputs:
+  LoadBalancerURL:
+    Description: Application Load Balancer URL
+    Value: !Sub http://${ApplicationLoadBalancer.DNSName}
+    Export:
+      Name: !Sub ${Environment}-laravel-alb-url
+
+  ECSCluster:
+    Description: ECS Cluster name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${Environment}-laravel-cluster-name
+
+  ECSService:
+    Description: ECS Service name
+    Value: !Ref ECSService
+    Export:
+      Name: !Sub ${Environment}-laravel-service-name
+
+  TaskDefinition:
+    Description: ECS Task Definition ARN
+    Value: !Ref TaskDefinition
+    Export:
+      Name: !Sub ${Environment}-laravel-task-definition

@@ -1,0 +1,286 @@
+pipeline {
+    agent any
+    
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['staging', 'production'], description: 'Environment to rollback')
+        string(name: 'ROLLBACK_TO_REVISION', defaultValue: '', description: 'Task definition revision to rollback to (leave empty for previous)')
+        booleanParam(name: 'ROLLBACK_DATABASE', defaultValue: false, description: 'Rollback database migrations (DANGEROUS)')
+        string(name: 'BACKUP_NAME', defaultValue: '', description: 'Database backup name to restore (required if rolling back database)')
+    }
+    
+    environment {
+        AWS_DEFAULT_REGION = 'us-east-1'
+        ECS_CLUSTER = 'laravel-cluster'
+        ECS_SERVICE_STAGING = 'laravel-service-staging'
+        ECS_SERVICE_PRODUCTION = 'laravel-service-production'
+    }
+    
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    if (params.ROLLBACK_DATABASE && !params.BACKUP_NAME) {
+                        error('Database backup name is required when rolling back database')
+                    }
+                    
+                    // Set environment-specific variables
+                    if (params.ENVIRONMENT == 'production') {
+                        env.ECS_SERVICE = env.ECS_SERVICE_PRODUCTION
+                        env.DB_NAME = 'laravel_production'
+                    } else {
+                        env.ECS_SERVICE = env.ECS_SERVICE_STAGING
+                        env.DB_NAME = 'laravel_staging'
+                    }
+                }
+            }
+        }
+        
+        stage('Get Current Deployment Info') {
+            steps {
+                script {
+                    // Get current service info
+                    sh '''
+                        aws ecs describe-services \
+                            --cluster $ECS_CLUSTER \
+                            --services $ECS_SERVICE \
+                            --query 'services[0]' > current-service.json
+                        
+                        # Get current task definition ARN
+                        CURRENT_TASK_DEF=$(jq -r '.taskDefinition' current-service.json)
+                        echo "Current task definition: $CURRENT_TASK_DEF"
+                        echo "$CURRENT_TASK_DEF" > current-task-definition-arn.txt
+                        
+                        # Get deployment history
+                        jq -r '.deployments[] | "\\(.taskDefinition) - \\(.status) - \\(.createdAt)"' current-service.json > deployment-history.txt
+                        echo "Deployment history:"
+                        cat deployment-history.txt
+                    '''
+                }
+            }
+        }
+        
+        stage('Determine Rollback Target') {
+            steps {
+                script {
+                    if (params.ROLLBACK_TO_REVISION) {
+                        // Use specified revision
+                        env.TARGET_TASK_DEF = "laravel-task-${params.ENVIRONMENT}:${params.ROLLBACK_TO_REVISION}"
+                    } else {
+                        // Get previous stable deployment
+                        sh '''
+                            # Get the second deployment (previous one)
+                            PREVIOUS_TASK_DEF=$(jq -r '.deployments[1].taskDefinition' current-service.json)
+                            
+                            if [ "$PREVIOUS_TASK_DEF" = "null" ]; then
+                                echo "No previous deployment found"
+                                exit 1
+                            fi
+                            
+                            echo "Rolling back to: $PREVIOUS_TASK_DEF"
+                            echo "$PREVIOUS_TASK_DEF" > target-task-definition-arn.txt
+                        '''
+                        
+                        env.TARGET_TASK_DEF = readFile('target-task-definition-arn.txt').trim()
+                    }
+                    
+                    echo "Rollback target: ${env.TARGET_TASK_DEF}"
+                }
+            }
+        }
+        
+        stage('Confirmation') {
+            steps {
+                script {
+                    def message = """
+                    ⚠️  ROLLBACK CONFIRMATION ⚠️
+                    
+                    Environment: ${params.ENVIRONMENT}
+                    Current Task Definition: ${readFile('current-task-definition-arn.txt').trim()}
+                    Rollback Target: ${env.TARGET_TASK_DEF}
+                    Database Rollback: ${params.ROLLBACK_DATABASE}
+                    ${params.ROLLBACK_DATABASE ? "Database Backup: ${params.BACKUP_NAME}" : ""}
+                    
+                    This action will rollback the application to a previous version.
+                    ${params.ROLLBACK_DATABASE ? "⚠️  DATABASE WILL BE RESTORED FROM BACKUP - THIS IS IRREVERSIBLE!" : ""}
+                    
+                    Do you want to proceed?
+                    """
+                    
+                    timeout(time: 5, unit: 'MINUTES') {
+                        input message: message, ok: 'Proceed with Rollback'
+                    }
+                }
+            }
+        }
+        
+        stage('Create Backup') {
+            steps {
+                script {
+                    // Create a backup before rollback
+                    def backupName = "pre-rollback-${env.BUILD_NUMBER}-${new Date().format('yyyyMMdd-HHmmss')}"
+                    
+                    sh """
+                        # Create database backup
+                        aws ecs run-task \
+                            --cluster $ECS_CLUSTER \
+                            --task-definition laravel-backup-task-${params.ENVIRONMENT} \
+                            --network-configuration "awsvpcConfiguration={subnets=[${ECS_SUBNET_ID}],securityGroups=[${ECS_SECURITY_GROUP_ID}],assignPublicIp=ENABLED}" \
+                            --overrides '{
+                                "containerOverrides": [
+                                    {
+                                        "name": "laravel-app",
+                                        "command": ["sh", "-c", "mysqldump -h\\$DB_HOST -u\\$DB_USERNAME -p\\$DB_PASSWORD \\$DB_DATABASE > /backups/${backupName}.sql && aws s3 cp /backups/${backupName}.sql s3://laravel-backups/${params.ENVIRONMENT}/"]
+                                    }
+                                ]
+                            }' \
+                            --query 'tasks[0].taskArn' \
+                            --output text > backup-task-arn.txt
+                        
+                        # Wait for backup to complete
+                        aws ecs wait tasks-stopped \
+                            --cluster $ECS_CLUSTER \
+                            --tasks \$(cat backup-task-arn.txt)
+                    """
+                    
+                    echo "Backup created: ${backupName}.sql"
+                }
+            }
+        }
+        
+        stage('Rollback Database') {
+            when {
+                expression { params.ROLLBACK_DATABASE }
+            }
+            steps {
+                script {
+                    sh """
+                        # Restore database from backup
+                        aws ecs run-task \
+                            --cluster $ECS_CLUSTER \
+                            --task-definition laravel-restore-task-${params.ENVIRONMENT} \
+                            --network-configuration "awsvpcConfiguration={subnets=[${ECS_SUBNET_ID}],securityGroups=[${ECS_SECURITY_GROUP_ID}],assignPublicIp=ENABLED}" \
+                            --overrides '{
+                                "containerOverrides": [
+                                    {
+                                        "name": "laravel-app",
+                                        "command": ["sh", "-c", "aws s3 cp s3://laravel-backups/${params.ENVIRONMENT}/${params.BACKUP_NAME} /tmp/restore.sql && mysql -h\\$DB_HOST -u\\$DB_USERNAME -p\\$DB_PASSWORD \\$DB_DATABASE < /tmp/restore.sql"]
+                                    }
+                                ]
+                            }' \
+                            --query 'tasks[0].taskArn' \
+                            --output text > restore-task-arn.txt
+                        
+                        # Wait for restore to complete
+                        aws ecs wait tasks-stopped \
+                            --cluster $ECS_CLUSTER \
+                            --tasks \$(cat restore-task-arn.txt)
+                        
+                        # Check restore task exit code
+                        EXIT_CODE=\$(aws ecs describe-tasks \
+                            --cluster $ECS_CLUSTER \
+                            --tasks \$(cat restore-task-arn.txt) \
+                            --query 'tasks[0].containers[0].exitCode' \
+                            --output text)
+                        
+                        if [ "\$EXIT_CODE" != "0" ]; then
+                            echo "Database restore failed with exit code: \$EXIT_CODE"
+                            exit 1
+                        fi
+                    """
+                }
+            }
+        }
+        
+        stage('Rollback Application') {
+            steps {
+                script {
+                    sh '''
+                        # Update ECS service to use previous task definition
+                        aws ecs update-service \
+                            --cluster $ECS_CLUSTER \
+                            --service $ECS_SERVICE \
+                            --task-definition $TARGET_TASK_DEF
+                        
+                        echo "Rollback initiated. Service is updating to: $TARGET_TASK_DEF"
+                    '''
+                }
+            }
+        }
+        
+        stage('Wait for Rollback') {
+            steps {
+                script {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        sh '''
+                            echo "Waiting for ECS service to stabilize after rollback..."
+                            aws ecs wait services-stable \
+                                --cluster $ECS_CLUSTER \
+                                --services $ECS_SERVICE
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Verify Rollback') {
+            steps {
+                script {
+                    // Get ALB endpoint
+                    def albEndpoint = sh(
+                        script: '''
+                            aws elbv2 describe-load-balancers \
+                                --names laravel-alb-${ENVIRONMENT} \
+                                --query 'LoadBalancers[0].DNSName' \
+                                --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    
+                    // Health check with retry
+                    retry(5) {
+                        sleep(30)
+                        sh "curl -f http://${albEndpoint}/health"
+                    }
+                    
+                    // Verify the rollback was successful
+                    sh '''
+                        CURRENT_TASK_DEF=$(aws ecs describe-services \
+                            --cluster $ECS_CLUSTER \
+                            --services $ECS_SERVICE \
+                            --query 'services[0].taskDefinition' \
+                            --output text)
+                        
+                        if [ "$CURRENT_TASK_DEF" = "$TARGET_TASK_DEF" ]; then
+                            echo "✅ Rollback successful! Current task definition: $CURRENT_TASK_DEF"
+                        else
+                            echo "❌ Rollback verification failed. Expected: $TARGET_TASK_DEF, Got: $CURRENT_TASK_DEF"
+                            exit 1
+                        fi
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            archiveArtifacts artifacts: '*.json,*.txt', allowEmptyArchive: true
+        }
+        
+        success {
+            slackSend(
+                channel: '#deployments',
+                color: 'good',
+                message: "✅ Rollback successful: ${params.ENVIRONMENT} rolled back to ${env.TARGET_TASK_DEF}\nBuild: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+            )
+        }
+        
+        failure {
+            slackSend(
+                channel: '#deployments',
+                color: 'danger',
+                message: "❌ Rollback failed: ${params.ENVIRONMENT} rollback failed\nBuild: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nTarget: ${env.TARGET_TASK_DEF}"
+            )
+        }
+    }
+}
