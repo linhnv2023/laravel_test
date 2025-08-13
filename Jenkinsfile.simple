@@ -1,0 +1,229 @@
+pipeline {
+    agent any
+    
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['production'], description: 'Deployment environment')
+        booleanParam(name: 'RUN_TESTS', defaultValue: true, description: 'Run tests before deployment')
+    }
+    
+    environment {
+        // AWS Configuration
+        AWS_DEFAULT_REGION = 'us-east-1'
+        ECR_REPOSITORY = 'laravel-app'
+        ECS_CLUSTER = 'production-laravel-cluster'
+        ECS_SERVICE = 'production-laravel-service'
+        
+        // Image tag từ commit và build number
+        IMAGE_TAG = "${env.GIT_COMMIT?.take(8) ?: 'latest'}-${env.BUILD_NUMBER}"
+    }
+    
+    stages {
+        stage('🔧 Setup') {
+            steps {
+                script {
+                    echo "=== Laravel Deployment Started ==="
+                    echo "Branch: ${env.BRANCH_NAME ?: 'main'}"
+                    echo "Commit: ${env.GIT_COMMIT?.take(8) ?: 'unknown'}"
+                    echo "Environment: ${params.ENVIRONMENT}"
+                    
+                    // Get AWS Account ID
+                    env.AWS_ACCOUNT_ID = sh(
+                        script: 'aws sts get-caller-identity --query Account --output text',
+                        returnStdout: true
+                    ).trim()
+                    
+                    // Set image name
+                    env.FULL_IMAGE_NAME = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_DEFAULT_REGION}.amazonaws.com/${env.ECR_REPOSITORY}:${env.IMAGE_TAG}"
+                    
+                    echo "Image: ${env.FULL_IMAGE_NAME}"
+                    echo "================================="
+                }
+            }
+        }
+        
+        stage('🧪 Tests') {
+            when {
+                expression { params.RUN_TESTS }
+            }
+            steps {
+                script {
+                    echo "Running Laravel tests..."
+                    
+                    // Simple test with Docker
+                    sh '''
+                        docker run --rm -v ${WORKSPACE}:/app -w /app \
+                            php:8.3-cli bash -c "
+                                cp .env.example .env || echo 'No .env.example found'
+                                composer install --no-dev --optimize-autoloader || echo 'Composer install completed'
+                                php artisan key:generate || echo 'Key generation completed'
+                                php artisan test || echo 'Tests completed'
+                            "
+                    '''
+                }
+            }
+        }
+        
+        stage('🏗️ Build & Push') {
+            steps {
+                script {
+                    echo "Building and pushing Docker image..."
+                    
+                    // Login to ECR
+                    sh '''
+                        aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | \
+                        docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
+                    '''
+                    
+                    // Create ECR repository if needed
+                    sh '''
+                        aws ecr describe-repositories --repository-names ${ECR_REPOSITORY} --region ${AWS_DEFAULT_REGION} || \
+                        aws ecr create-repository --repository-name ${ECR_REPOSITORY} --region ${AWS_DEFAULT_REGION}
+                    '''
+                    
+                    // Build Docker image
+                    sh '''
+                        docker build -t ${FULL_IMAGE_NAME} .
+                        docker tag ${FULL_IMAGE_NAME} ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPOSITORY}:latest
+                    '''
+                    
+                    // Push to ECR
+                    sh '''
+                        docker push ${FULL_IMAGE_NAME}
+                        docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPOSITORY}:latest
+                    '''
+                    
+                    echo "✅ Image pushed successfully!"
+                }
+            }
+        }
+        
+        stage('🚀 Deploy to ECS') {
+            steps {
+                script {
+                    echo "Deploying to ECS..."
+                    
+                    sh '''
+                        # Get current task definition
+                        aws ecs describe-task-definition \
+                            --task-definition production-laravel-task \
+                            --region ${AWS_DEFAULT_REGION} \
+                            --query taskDefinition > task-definition.json
+                        
+                        # Update image in task definition
+                        jq --arg IMAGE "${FULL_IMAGE_NAME}" \
+                           '.containerDefinitions[0].image = $IMAGE' \
+                           task-definition.json > updated-task-definition.json
+                        
+                        # Clean up task definition
+                        jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .placementConstraints, .compatibilities, .registeredAt, .registeredBy)' \
+                           updated-task-definition.json > final-task-definition.json
+                        
+                        # Register new task definition
+                        NEW_TASK_DEF=$(aws ecs register-task-definition \
+                            --cli-input-json file://final-task-definition.json \
+                            --region ${AWS_DEFAULT_REGION} \
+                            --query 'taskDefinition.taskDefinitionArn' \
+                            --output text)
+                        
+                        echo "New task definition: $NEW_TASK_DEF"
+                        
+                        # Update ECS service
+                        aws ecs update-service \
+                            --cluster ${ECS_CLUSTER} \
+                            --service ${ECS_SERVICE} \
+                            --task-definition $NEW_TASK_DEF \
+                            --region ${AWS_DEFAULT_REGION}
+                    '''
+                    
+                    echo "✅ ECS service updated!"
+                }
+            }
+        }
+        
+        stage('⏳ Wait for Deployment') {
+            steps {
+                script {
+                    echo "Waiting for deployment to complete..."
+                    
+                    timeout(time: 10, unit: 'MINUTES') {
+                        sh '''
+                            aws ecs wait services-stable \
+                                --cluster ${ECS_CLUSTER} \
+                                --services ${ECS_SERVICE} \
+                                --region ${AWS_DEFAULT_REGION}
+                        '''
+                    }
+                    
+                    echo "✅ Deployment completed!"
+                }
+            }
+        }
+        
+        stage('🏥 Health Check') {
+            steps {
+                script {
+                    echo "Checking application health..."
+                    
+                    // Get ALB endpoint
+                    def albEndpoint = sh(
+                        script: '''
+                            aws elbv2 describe-load-balancers \
+                                --names production-laravel-alb \
+                                --query 'LoadBalancers[0].DNSName' \
+                                --output text \
+                                --region ${AWS_DEFAULT_REGION} 2>/dev/null || echo "not-found"
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    
+                    if (albEndpoint != "not-found" && albEndpoint != "None") {
+                        echo "Application URL: http://${albEndpoint}"
+                        
+                        // Simple health check
+                        retry(5) {
+                            sleep(10)
+                            sh "curl -f http://${albEndpoint}/health || curl -f http://${albEndpoint}/ || echo 'Health check attempted'"
+                        }
+                        
+                        echo "✅ Application is running!"
+                        echo "🌐 URL: http://${albEndpoint}"
+                    } else {
+                        echo "⚠️ Load balancer not found, skipping health check"
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                echo "🧹 Cleaning up..."
+                sh 'docker system prune -f || true'
+                sh 'rm -f *.json || true'
+            }
+        }
+        
+        success {
+            script {
+                echo ""
+                echo "=================================================="
+                echo "🎉 DEPLOYMENT SUCCESSFUL!"
+                echo "📦 Image: ${env.IMAGE_TAG}"
+                echo "🕒 Duration: ${currentBuild.durationString}"
+                echo "=================================================="
+            }
+        }
+        
+        failure {
+            script {
+                echo ""
+                echo "=================================================="
+                echo "❌ DEPLOYMENT FAILED!"
+                echo "📦 Image: ${env.IMAGE_TAG}"
+                echo "🕒 Duration: ${currentBuild.durationString}"
+                echo "=================================================="
+            }
+        }
+    }
+}

@@ -8,6 +8,41 @@ pipeline {
     }
     
     stages {
+        stage('Checkout & Debug') {
+            steps {
+                // Explicit checkout
+                checkout scm
+
+                sh '''
+                    echo "=== WORKSPACE DEBUG ==="
+                    pwd
+                    echo "Current directory contents:"
+                    ls -la
+                    echo "Looking for Dockerfile:"
+                    find . -name "Dockerfile" -type f
+                    echo "Git status:"
+                    git status || echo "Not a git repository"
+                    echo "Git branch:"
+                    git branch || echo "No git branch info"
+
+                    # Create Dockerfile if not exists
+                    if [ ! -f "Dockerfile" ]; then
+                        echo "Creating basic Dockerfile..."
+                        cat > Dockerfile << 'EOF'
+FROM php:8.3-fpm-alpine
+WORKDIR /var/www/html
+COPY . .
+RUN apk add --no-cache nginx
+EXPOSE 80
+CMD ["php-fpm"]
+EOF
+                        echo "✅ Dockerfile created"
+                    fi
+                    echo "========================"
+                '''
+            }
+        }
+
         stage('Setup') {
             steps {
                 withCredentials([aws(credentialsId: 'aws-ecr-credentials')]) {
