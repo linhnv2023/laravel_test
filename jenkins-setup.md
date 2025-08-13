@@ -155,7 +155,6 @@ Jenkins cần các permissions sau:
 ## Troubleshooting
 
 ### Common Issues:
-
 1. **Docker permission denied**:
    ```bash
    sudo usermod -aG docker jenkins
