@@ -20,6 +20,7 @@ Vào **Manage Jenkins** → **Manage Credentials** → **Global** → **Add Cred
    - ID: `aws-credentials`
    - Access Key ID: Your AWS Access Key
    - Secret Access Key: Your AWS Secret Key
+   - Description: `AWS credentials for ECR and ECS`
 
 2. **GitHub Credentials** (nếu repo private):
    - Kind: Username with password
