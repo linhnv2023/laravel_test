@@ -10,7 +10,7 @@ pipeline {
     stages {
         stage('Setup') {
             steps {
-                withCredentials([aws(credentialsId: 'aws-ecr-credentials', region: 'us-east-1')]) {
+                withCredentials([aws(credentialsId: 'aws-ecr-credentials')]) {
                     script {
                         echo "Starting deployment..."
                         env.AWS_ACCOUNT_ID = sh(script: 'aws sts get-caller-identity --query Account --output text', returnStdout: true).trim()
@@ -23,7 +23,7 @@ pipeline {
         
         stage('Pre-Build Check') {
             steps {
-                withCredentials([aws(credentialsId: 'aws-ecr-credentials', region: 'us-east-1')]) {
+                withCredentials([aws(credentialsId: 'aws-ecr-credentials')]) {
                     sh '''
                         echo "Checking prerequisites..."
 
@@ -35,8 +35,17 @@ pipeline {
                         aws --version
                         aws sts get-caller-identity
 
+                        # Check workspace files
+                        echo "Workspace contents:"
+                        ls -la
+
                         # Check Dockerfile exists
-                        ls -la Dockerfile
+                        if [ -f "Dockerfile" ]; then
+                            echo "✅ Dockerfile found"
+                        else
+                            echo "❌ Dockerfile not found"
+                            exit 1
+                        fi
 
                         # Check source code
                         ls -la composer.json || echo "No composer.json found"
@@ -50,7 +59,7 @@ pipeline {
 
         stage('Build & Push to ECR') {
             steps {
-                withCredentials([aws(credentialsId: 'aws-ecr-credentials', region: 'us-east-1')]) {
+                withCredentials([aws(credentialsId: 'aws-ecr-credentials')]) {
                     sh '''
                         echo "Starting build and push to ECR..."
 
