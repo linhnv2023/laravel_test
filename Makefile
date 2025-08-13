@@ -1,54 +1,95 @@
+# ==========================================
 # Laravel Docker Makefile
+# ==========================================
+# Tập hợp các commands tiện ích để quản lý Laravel Docker environment
+# Usage: make <command>
+# Help: make help
 
-# Variables
-DOCKER_COMPOSE = docker-compose
-DOCKER_COMPOSE_PROD = docker-compose -f docker-compose.prod.yml
-DOCKER_EXEC = docker exec -it
-APP_CONTAINER = laravel-app
-MYSQL_CONTAINER = laravel-mysql
+# ==========================================
+# VARIABLES - CẤU HÌNH CƠ BẢN
+# ==========================================
+DOCKER_COMPOSE = docker-compose          # Command docker-compose
+DOCKER_EXEC = docker exec -it            # Command để exec vào container
+APP_CONTAINER = laravel-app              # Tên container chứa Laravel app
+MYSQL_CONTAINER = laravel-mysql          # Tên container chứa MySQL
 
-# Colors for output
-GREEN = \033[0;32m
-YELLOW = \033[1;33m
-RED = \033[0;31m
-NC = \033[0m # No Color
+# ==========================================
+# COLORS - MÀU SẮC CHO OUTPUT
+# ==========================================
+GREEN = \033[0;32m                       # Màu xanh lá (success)
+YELLOW = \033[1;33m                      # Màu vàng (warning/info)
+RED = \033[0;31m                         # Màu đỏ (error)
+NC = \033[0m                             # No Color (reset)
 
+# ==========================================
+# PHONY TARGETS - KHÔNG PHẢI FILE THẬT
+# ==========================================
 .PHONY: help build up down restart logs shell mysql artisan composer npm test clean
 
-# Default target
-help: ## Show this help message
+# ==========================================
+# DEFAULT TARGET - HIỂN THỊ HELP
+# ==========================================
+help: ## Hiển thị danh sách commands có thể sử dụng
 	@echo "$(GREEN)Laravel Docker Commands$(NC)"
 	@echo "======================="
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "$(YELLOW)%-20s$(NC) %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-# Development commands
-build: ## Build Docker images
+# ==========================================
+# DEVELOPMENT COMMANDS - LỆNH PHÁT TRIỂN
+# ==========================================
+
+build: ## Build Docker images (không cache - clean build)
 	@echo "$(GREEN)Building Docker images...$(NC)"
+	# Build tất cả images từ đầu, không sử dụng cache
+	# Chậm hơn nhưng đảm bảo images mới nhất
 	$(DOCKER_COMPOSE) build --no-cache
 
-up: ## Start development environment
+build-fast: ## Build Docker images (có cache - nhanh hơn)
+	@echo "$(GREEN)Building Docker images (with cache)...$(NC)"
+	# Build với cache, nhanh hơn cho lần build tiếp theo
+	# Sử dụng khi chỉ có thay đổi nhỏ
+	$(DOCKER_COMPOSE) build
+
+up: ## Khởi động development environment
 	@echo "$(GREEN)Starting development environment...$(NC)"
+	# Khởi động tất cả containers trong background (-d = detached)
 	$(DOCKER_COMPOSE) up -d
 	@echo "$(GREEN)Application is running at http://localhost:8000$(NC)"
+	@echo "$(YELLOW)Waiting for services to be healthy...$(NC)"
+	# Hiển thị status của các containers
+	@$(DOCKER_COMPOSE) ps
 
-down: ## Stop development environment
+up-nginx: ## Khởi động với Nginx proxy (production-like)
+	@echo "$(GREEN)Starting with Nginx proxy...$(NC)"
+	# Khởi động với profile nginx (bao gồm Nginx container)
+	$(DOCKER_COMPOSE) --profile nginx up -d
+	@echo "$(GREEN)Application is running at http://localhost (Nginx) and http://localhost:8000 (Direct)$(NC)"
+
+down: ## Dừng development environment
 	@echo "$(YELLOW)Stopping development environment...$(NC)"
+	# Dừng và xóa tất cả containers (giữ lại volumes)
 	$(DOCKER_COMPOSE) down
 
 restart: ## Restart development environment
 	@echo "$(YELLOW)Restarting development environment...$(NC)"
+	# Restart tất cả containers (không rebuild)
 	$(DOCKER_COMPOSE) restart
 
-logs: ## Show logs
+# ==========================================
+# LOGGING COMMANDS - XEM LOGS
+# ==========================================
+
+logs: ## Xem logs của tất cả services (realtime)
+	# -f = follow (theo dõi realtime)
 	$(DOCKER_COMPOSE) logs -f
 
-logs-app: ## Show application logs
+logs-app: ## Xem logs của Laravel application
 	$(DOCKER_COMPOSE) logs -f app
 
-logs-nginx: ## Show nginx logs
+logs-nginx: ## Xem logs của Nginx server
 	$(DOCKER_COMPOSE) logs -f nginx
 
-logs-mysql: ## Show MySQL logs
+logs-mysql: ## Xem logs của MySQL database
 	$(DOCKER_COMPOSE) logs -f mysql
 
 # Production commands
@@ -156,4 +197,29 @@ backup-db: ## Backup MySQL database
 # Health check
 health: ## Check application health
 	@echo "$(GREEN)Checking application health...$(NC)"
-	curl -f http://localhost:8000/health || echo "$(RED)Health check failed$(NC)"
+	@curl -f http://localhost:8000 > /dev/null 2>&1 && echo "$(GREEN)✅ Application is healthy$(NC)" || echo "$(RED)❌ Application health check failed$(NC)"
+
+health-all: ## Check all services health
+	@echo "$(GREEN)Checking all services health...$(NC)"
+	@$(DOCKER_COMPOSE) ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}"
+
+# Performance optimization
+optimize-prod: ## Optimize for production
+	@echo "$(GREEN)Optimizing for production...$(NC)"
+	$(DOCKER_EXEC) $(APP_CONTAINER) php artisan config:cache
+	$(DOCKER_EXEC) $(APP_CONTAINER) php artisan route:cache
+	$(DOCKER_EXEC) $(APP_CONTAINER) php artisan view:cache
+	$(DOCKER_EXEC) $(APP_CONTAINER) php artisan event:cache
+	$(DOCKER_EXEC) $(APP_CONTAINER) composer dump-autoload --optimize --classmap-authoritative
+	@echo "$(GREEN)✅ Production optimization completed$(NC)"
+
+# Quick setup for new developers
+setup: ## Quick setup for new developers
+	@echo "$(GREEN)🚀 Setting up Laravel development environment...$(NC)"
+	make build-fast
+	make up
+	@echo "$(YELLOW)⏳ Waiting for services to start...$(NC)"
+	@sleep 10
+	make composer-install
+	make migrate
+	@echo "$(GREEN)✅ Setup completed! Visit http://localhost:8000$(NC)"
