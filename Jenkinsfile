@@ -11,9 +11,9 @@ pipeline {
     environment {
         AWS_DEFAULT_REGION = 'us-east-1'
         ECR_REPOSITORY = 'laravel-app'
-        ECS_CLUSTER = 'laravel-cluster'
+        ECS_CLUSTER = 'production-laravel-cluster'
         DOCKER_BUILDKIT = '1'
-        
+
         // Dynamic environment variables
         ECS_SERVICE = "${params.ENVIRONMENT}-laravel-service"
         IMAGE_TAG = "${env.GIT_COMMIT.take(8)}-${env.BUILD_NUMBER}"

@@ -30,6 +30,14 @@ COPY docker/supervisor/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+# Create necessary directories for volume mounts
+RUN mkdir -p /app/storage/logs \
+    && mkdir -p /app/storage/app \
+    && mkdir -p /app/storage/framework/cache \
+    && mkdir -p /app/storage/framework/sessions \
+    && mkdir -p /app/storage/framework/views \
+    && mkdir -p /app/bootstrap/cache
+
 # Set proper permissions
 RUN chown -R application:application /app \
     && chmod -R 755 /app/storage \

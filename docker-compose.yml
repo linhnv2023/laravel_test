@@ -20,7 +20,25 @@ services:
 
     # Mount volumes (chia sẻ files giữa host và container)
     volumes:
-      - ./:/app                     # Mount toàn bộ source code (development)
+      # Mount selective - chỉ những gì cần thiết cho development
+      - ./app:/app/app                              # Laravel app code
+      - ./config:/app/config                        # Configuration files
+      - ./database:/app/database                    # Database migrations, seeders
+      - ./public:/app/public                        # Public assets
+      - ./resources:/app/resources                  # Views, CSS, JS source
+      - ./routes:/app/routes                        # Route definitions
+      - ./storage/app:/app/storage/app              # Application storage
+      - ./storage/framework:/app/storage/framework  # Framework storage
+      - ./tests:/app/tests                          # Test files
+      - ./composer.json:/app/composer.json          # Composer config
+      - ./composer.lock:/app/composer.lock          # Composer lock
+      - ./package.json:/app/package.json            # NPM config
+      - ./artisan:/app/artisan                      # Artisan command
+      - ./vite.config.js:/app/vite.config.js        # Vite config
+      - ./phpunit.xml:/app/phpunit.xml              # PHPUnit config
+      # Separate volume for logs (không mount từ host)
+      - app_storage_logs:/app/storage/logs          # Container logs (isolated)
+      # PHP configuration
       - ./docker/php/php.ini:/usr/local/etc/php/conf.d/custom.ini  # PHP config
 
     # Expose port ra ngoài
@@ -179,7 +197,16 @@ services:
 
     # Mount source code để có thể chạy Laravel commands
     volumes:
-      - ./:/app                    # Mount source code
+      # Mount selective - chỉ những gì cần thiết
+      - ./app:/app/app                              # Laravel app code
+      - ./config:/app/config                        # Configuration files
+      - ./database:/app/database                    # Database migrations, seeders
+      - ./routes:/app/routes                        # Route definitions
+      - ./composer.json:/app/composer.json          # Composer config
+      - ./composer.lock:/app/composer.lock          # Composer lock
+      - ./artisan:/app/artisan                      # Artisan command
+      # Shared logs volume
+      - app_storage_logs:/app/storage/logs          # Shared logs với app container
 
     # Override entrypoint để chạy queue worker thay vì web server
     entrypoint: []                 # Xóa entrypoint mặc định
@@ -223,7 +250,16 @@ services:
 
     # Mount source code để có thể chạy Laravel commands
     volumes:
-      - ./:/app                    # Mount source code
+      # Mount selective - chỉ những gì cần thiết
+      - ./app:/app/app                              # Laravel app code
+      - ./config:/app/config                        # Configuration files
+      - ./database:/app/database                    # Database migrations, seeders
+      - ./routes:/app/routes                        # Route definitions
+      - ./composer.json:/app/composer.json          # Composer config
+      - ./composer.lock:/app/composer.lock          # Composer lock
+      - ./artisan:/app/artisan                      # Artisan command
+      # Shared logs volume
+      - app_storage_logs:/app/storage/logs          # Shared logs với app container
 
     # Override entrypoint để chạy scheduler
     entrypoint: []                 # Xóa entrypoint mặc định
@@ -264,6 +300,10 @@ volumes:
   # Volume cho Redis data - cache và session data persistent
   redis_data:
     driver: local                  # Lưu trữ local trên host machine
+
+  # Volume cho application logs - isolated từ host, shared giữa containers
+  app_storage_logs:
+    driver: local                  # Logs riêng biệt, không mount từ host
 
 # ==========================================
 # DOCKER NETWORKS - KẾT NỐI GIỮA CONTAINERS
