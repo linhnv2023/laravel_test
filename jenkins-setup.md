@@ -69,12 +69,13 @@ Cài đặt các plugins sau:
 2. **Docker Pipeline Plugin**
 3. **AWS Pipeline Plugin**
 4. **GitHub Plugin**
-5. **Slack Notification Plugin**
-6. **JUnit Plugin**
-7. **HTML Publisher Plugin**
-8. **Timestamper Plugin**
-9. **Build Timeout Plugin**
-10. **Workspace Cleanup Plugin**
+5. **Generic Webhook Trigger Plugin** ⭐ (Quan trọng)
+6. **Slack Notification Plugin**
+7. **JUnit Plugin**
+8. **HTML Publisher Plugin**
+9. **Timestamper Plugin**
+10. **Build Timeout Plugin**
+11. **Workspace Cleanup Plugin**
 
 ## Docker Configuration
 

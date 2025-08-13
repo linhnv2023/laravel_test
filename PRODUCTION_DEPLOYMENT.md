@@ -20,10 +20,10 @@ Developer Push Code → GitHub → Webhook → Jenkins → Build & Test → ECR 
 
 ### ✅ Jenkins Setup
 - [ ] Jenkins server đã được cài đặt
-- [ ] Các plugins cần thiết đã được cài đặt
+- [ ] Các plugins cần thiết đã được cài đặt (bao gồm Generic Webhook Trigger)
 - [ ] AWS credentials đã được cấu hình
 - [ ] Docker đã được cấu hình
-- [ ] Pipeline job đã được tạo
+- [ ] Pipeline job đã được tạo với Generic Webhook Trigger
 
 ### ✅ GitHub Setup
 - [ ] Repository đã có Jenkinsfile
@@ -76,8 +76,16 @@ aws cloudformation deploy \
    - RUN_MIGRATIONS: Boolean (default: true)
    - SKIP_BUILD: Boolean (default: false)
 
-3. **Cấu hình Build Triggers**:
-   - ✅ GitHub hook trigger for GITScm polling
+3. **Cấu hình Generic Webhook Trigger**:
+   - ✅ Generic Webhook Trigger
+   - Token: `laravel-deploy-token` (hoặc token bảo mật khác)
+   - Post content parameters:
+     - Variable: `BRANCH_NAME`
+     - Expression: `$.ref`
+     - JSONPath: `$.ref`
+   - Optional filters:
+     - Expression: `$ref`
+     - Text: `refs/heads/main` (chỉ trigger khi push vào main branch)
 
 ### Bước 3: Deploy lần đầu
 

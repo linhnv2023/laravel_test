@@ -14,28 +14,50 @@ pipeline {
         ECS_CLUSTER = 'production-laravel-cluster'
         DOCKER_BUILDKIT = '1'
 
+        // Webhook variables (from Generic Webhook Trigger)
+        WEBHOOK_BRANCH = "${env.BRANCH_NAME ?: 'refs/heads/main'}"
+        WEBHOOK_COMMIT = "${env.COMMIT_SHA ?: env.GIT_COMMIT}"
+        WEBHOOK_REPO = "${env.REPOSITORY_NAME ?: 'laravel-app'}"
+        WEBHOOK_PUSHER = "${env.PUSHER_NAME ?: 'unknown'}"
+
         // Dynamic environment variables
         ECS_SERVICE = "${params.ENVIRONMENT}-laravel-service"
-        IMAGE_TAG = "${env.GIT_COMMIT.take(8)}-${env.BUILD_NUMBER}"
+        IMAGE_TAG = "${env.WEBHOOK_COMMIT?.take(8) ?: env.GIT_COMMIT?.take(8)}-${env.BUILD_NUMBER}"
         ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
     }
     
     stages {
-        stage('Checkout & Setup') {
+        stage('Webhook Info & Setup') {
             steps {
                 script {
+                    // Display webhook information
+                    echo "=== Webhook Information ==="
+                    echo "Branch: ${env.WEBHOOK_BRANCH}"
+                    echo "Commit: ${env.WEBHOOK_COMMIT}"
+                    echo "Repository: ${env.WEBHOOK_REPO}"
+                    echo "Pusher: ${env.WEBHOOK_PUSHER}"
+                    echo "Commit Message: ${env.COMMIT_MESSAGE ?: 'N/A'}"
+                    echo "=========================="
+
                     // Get AWS Account ID
                     env.AWS_ACCOUNT_ID = sh(
                         script: 'aws sts get-caller-identity --query Account --output text',
                         returnStdout: true
                     ).trim()
-                    
+
                     // Set full ECR registry URL
                     env.ECR_REGISTRY = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_DEFAULT_REGION}.amazonaws.com"
                     env.FULL_IMAGE_NAME = "${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}:${env.IMAGE_TAG}"
-                    
+
                     echo "Building image: ${env.FULL_IMAGE_NAME}"
                     echo "Deploying to: ${params.ENVIRONMENT}"
+
+                    // Skip deployment if not main branch (for webhook triggers)
+                    if (env.WEBHOOK_BRANCH && !env.WEBHOOK_BRANCH.contains('main')) {
+                        echo "⚠️ Skipping deployment - not main branch: ${env.WEBHOOK_BRANCH}"
+                        currentBuild.result = 'SUCCESS'
+                        return
+                    }
                 }
             }
         }
@@ -371,8 +393,11 @@ pipeline {
                     message: """
 ✅ *Deployment Successful!*
 • *Environment*: ${params.ENVIRONMENT}
+• *Repository*: ${env.WEBHOOK_REPO}
+• *Branch*: ${env.WEBHOOK_BRANCH?.replaceAll('refs/heads/', '') ?: 'main'}
+• *Pusher*: ${env.WEBHOOK_PUSHER}
 • *Image*: ${env.IMAGE_TAG}
-• *Commit*: ${env.GIT_COMMIT.take(8)}
+• *Commit*: ${env.WEBHOOK_COMMIT?.take(8) ?: env.GIT_COMMIT?.take(8)}
 • *Build*: #${env.BUILD_NUMBER}
 • *URL*: http://${albEndpoint}
 • *Duration*: ${currentBuild.durationString}
